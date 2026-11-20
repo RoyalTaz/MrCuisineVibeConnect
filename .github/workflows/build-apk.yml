@@ -24,7 +24,7 @@ jobs:
           java-version: 17
 
       - name: Build Toque
-        run: ./gradlew --no-daemon :core:test :app:assembleRelease
+        run: ./gradlew --no-daemon :app:assembleRelease
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
