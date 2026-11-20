@@ -437,6 +437,36 @@ class MainActivity : Activity() {
             }
         }.start()
     }
+	/**  ################################################################################ */
+	/**  ############################### Rajout Flo###################################### */
+	/**  ################################################################################ */
+    /** Ouvre directement Magisk, avec le bouton « Retour à Toque ». */
+    fun openMagisk() {
+        Thread {
+            val ok = ReturnBubble.ensurePermission(this)
+            main.post {
+                if (!ok) {
+                    toast(tr("Impossible d'afficher le bouton « Retour à Toque » (root ?) : ouverture annulée"), Ui.WARN)
+                    return@post
+                }
+                prefs.returnBubble = true
+                ReturnBubble.start(this)
+                try {
+                    val intent = Intent().apply {
+                        setClassName(
+                            "com.topjohnwu.magisk",
+                            "com.topjohnwu.magisk.ui.MainActivity"
+                        )
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    startActivity(intent)
+                } catch (_: Exception) {
+                    prefs.returnBubble = false
+                    ReturnBubble.stop(this)
+                }
+            }
+        }.start()
+    }
 
     companion object {
         private var reopenSettings = false
@@ -451,4 +481,8 @@ class MainActivity : Activity() {
             return clockFormat.format(Date())
         }
     }
+	/**  #################################################################################### */
+	/**  ############################### FIN Rajout Flo###################################### */
+	/**  #################################################################################### */
+
 }
