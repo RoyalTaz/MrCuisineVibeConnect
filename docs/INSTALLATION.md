@@ -14,8 +14,13 @@ Menu names below are those of the English interface (*Settings › Langue · Lan
 
 ## What you need
 
-- A Windows PC with Android Studio (for ADB) and [SP Flash Tool](https://spflashtool.com/)
-  (v5.1924 tested).
+- A Windows PC with Android Studio (for ADB) and [SP Flash Tool](https://spflashtool.com/download)
+  (v5.1924 tested). Upstream ships `SP_Flash_Tool_v5.1924_Win.rar`, a password-protected RAR (AES
+  password `spflashtool.com`, published on that page), not a ZIP; Windows 10 and Windows 11 before
+  23H2 cannot open RAR on their own, so extract it with 7-Zip or WinRAR. A *scripted* direct
+  download needs the header `Referer: https://spflashtool.com/download`, otherwise the server
+  returns HTML (a person can just use the download page). The script's pinned SHA-256 for
+  `flash_tool.exe` and `MTK_AllInOne_DA.bin` apply to the files inside the RAR.
 - A **USB-A male / USB-A male** data cable and a small Torx screwdriver. A USB-A ↔ USB-C cable
   does **not** work: the robot's port is a device port, so the PC's USB-C port never detects it.
 - The **MediaTek PreLoader USB VCOM** driver: search for it on the
@@ -43,6 +48,16 @@ Menu names below are those of the English interface (*Settings › Langue · Lan
    `0x1000000`, region `EMMC_USER`) and `recovery` (start `0x2d20000`, length `0x1000000`), click
    **Read Back**, then switch the robot on. You get `boot-original.img` and
    `recovery-original.img` (16 MB each): **keep them safe, they are your only way back.**
+
+   > **SKMC 1100 A1** (label under the robot, system image `v4.3a_2022-09-15`): the TWRP of the
+   > reference guide carries a 2018 kernel and this robot runs a 2022 one. Before step 4, rebuild
+   > TWRP around your own kernel: put the two backups in `C:\Toque\backup\`, then run
+   > [`tools\setup\toque-setup.ps1`](../tools/setup/toque-setup.ps1) with `-Step prepare` (it
+   > fetches and checks the TWRP image; its remarks about the driver and SP Flash Tool do not
+   > matter if you already have them), `-Step backup` (with the files already there it only checks
+   > them) and `-Step own-twrp`. These commands send nothing to the robot. Use the resulting
+   > `C:\Toque\twrp-own-kernel.img` wherever this page says `hacks/recovery.img` (step 4 below, and
+   > step 2 of the next section).
 4. **Download** tab, *Download Only*: tick only `boot`, with `hacks/recovery.img` (TWRP). Click
    **Download**, then switch the robot off and on again.
 5. Switch the robot off, unplug the cable, switch it on: **TWRP** starts. Plug the cable back in:
@@ -89,15 +104,18 @@ Only do this on your home network: anyone on it could then connect to the robot.
 2. `powershell -ExecutionPolicy Bypass -File tools\install-robot.ps1`
    (over Wi-Fi: add `-Ip <robot IP address>`).
 3. The script also allows Toque in Magisk (no prompt on the robot: Magisk's prompt closes by
-   itself after 10 s and then refuses for good) and checks that Magisk's busybox, which Toque
-   needs for the serial port, is in place.
+   itself after 10 s and then refuses), installs a boot script that allows it again at every
+   start (Magisk 31 forgets the permission of every app each time an Android 6 device starts),
+   and checks that Magisk's busybox, which Toque needs for the serial port, is in place.
 
 ## 4. First run — EMPTY bowl
 
 1. In Toque: **Settings › Machine › Real machine › Apply**. Toque turns off the stock app's motor service (reversible) and opens the
    serial port.
-2. The badge at the top right must switch to **Ready**. If not: Settings › Tools › Motor base
-   diagnostics (are frames received?) and Log.
+2. Success: the badge at the top right must read Ready with **no Demo or Twin marker** **and** the
+   journal must show the real link, e.g. `liaison ouverte : Base moteur (/dev/ttyMT…)`; `Démo (base simulée)`
+   means the mode was not applied. If not: Settings › Tools › Motor base diagnostics (are frames
+   received?) and Log.
 3. Empty bowl, lid closed, **hand near the main switch**:
    - Manual cooking: 10 s, speed 2 → the motor runs, then stops on its own.
    - Open the lid during a run → immediate stop, "Paused: lid open".

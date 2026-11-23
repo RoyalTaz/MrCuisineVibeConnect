@@ -7,8 +7,9 @@
 # install, wifi, cleanup. Lines starting with "HUMAN:" are actions only a person can do
 # (unscrewing, cables, power switch, Windows security prompts, a tap on the robot's screen).
 # A step that needs one stops and says so; run it again once the person is done.
+# SKMC 1100 A1 only: one more step, own-twrp, right after backup (see AGENTS.md).
 param(
-    [ValidateSet("status", "prepare", "driver", "backup", "flash-twrp", "root", "flash-root", "android", "install", "wifi", "cleanup")]
+    [ValidateSet("status", "prepare", "driver", "backup", "own-twrp", "flash-twrp", "root", "flash-root", "android", "install", "wifi", "cleanup")]
     [string]$Step = "status",
     [string]$Work = "C:\Toque",
     [string]$Apk = "",
@@ -85,17 +86,31 @@ function Get-Adb {
 
 function Adb {
     $adb = Get-Adb
-    $out = & $adb @args 2>&1 | Out-String
+    # Windows PowerShell 5.1: with ErrorActionPreference=Stop, a native command's stderr redirected
+    # with 2>&1 becomes a terminating error, and adb prints its push/pull progress on stderr. Keep
+    # going and turn the error records back into plain text lines.
+    $ErrorActionPreference = "Continue"
+    $out = & $adb @args 2>&1 | ForEach-Object { "$_" } | Out-String
     return $out.Trim()
 }
 
-# State of the robot as adb sees it: "recovery" (TWRP), "device" (Android), "unauthorized", or "".
-function Get-AdbState {
+# First "adb devices" entry as @{ Serial; State }: with -Usb the cable device (serial without
+# ":port"), with $Target only serials starting with it (default: -Ip), otherwise any device.
+function Get-AdbDevice([string]$Target = $Ip, [switch]$Usb) {
     $lines = (Adb devices) -split "`r?`n" | Where-Object { $_ -match "`t" }
-    if ($Ip -ne "") { $lines = $lines | Where-Object { $_ -like "$Ip*" } }
+    if ($Usb) { $lines = $lines | Where-Object { ($_ -split "`t")[0] -notmatch ":" } }
+    elseif ($Target -ne "") { $lines = $lines | Where-Object { $_ -like "$Target*" } }
     $first = $lines | Select-Object -First 1
-    if (-not $first) { return "" }
-    return ($first -split "`t")[1].Trim()
+    if (-not $first) { return $null }
+    $parts = $first -split "`t"
+    return [pscustomobject]@{ Serial = $parts[0].Trim(); State = $parts[1].Trim() }
+}
+
+# State of the robot as adb sees it: "recovery" (TWRP), "device" (Android), "unauthorized", or "".
+function Get-AdbState([string]$Target = $Ip) {
+    $dev = Get-AdbDevice $Target
+    if (-not $dev) { return "" }
+    return $dev.State
 }
 
 function Wait-AdbState([string[]]$wanted, [int]$seconds) {
@@ -108,6 +123,19 @@ function Wait-AdbState([string[]]$wanted, [int]$seconds) {
     return Get-AdbState
 }
 
+# Effective machine mode, read from Prefs: shared prefs "toque", key "mode" = demo, twin or
+# hardware. A missing file or key means demo (Prefs.Mode.of). Returns "" when it cannot be read.
+function Get-MachineMode {
+    $xml = Adb shell "su -c 'cat /data/data/app.toque/shared_prefs/toque.xml'"
+    if ($xml -match '<string name="mode">([^<]+)</string>') {
+        $m = $Matches[1].Trim()
+        if ($m -in "demo", "twin", "hardware") { return $m }
+        return "demo"
+    }
+    if ($xml -match '<map' -or $xml -match 'No such file or directory') { return "demo" }
+    return ""
+}
+
 function Test-BootImage([string]$path, [string]$what) {
     if (-not (Test-Path $path)) { Fail "$what missing: $path" }
     $len = (Get-Item $path).Length
@@ -118,6 +146,95 @@ function Test-BootImage([string]$path, [string]$what) {
         [void]$fs.Read($head, 0, 8)
     } finally { $fs.Close() }
     if ([Text.Encoding]::ASCII.GetString($head) -ne "ANDROID!") { Fail "$what is not an Android boot image (no ANDROID! header): do not continue." }
+}
+
+function Copy-Bytes([byte[]]$src, [long]$offset, [long]$count) {
+    $out = New-Object byte[] $count
+    [Array]::Copy($src, $offset, $out, 0, $count)
+    return , $out
+}
+
+function Get-BytesSha([byte[]]$bytes) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($bytes)) -replace "-", "").ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+# Parses an Android boot image (header version 0: boot, recovery and the TWRP image all use it).
+function Read-BootImage([string]$path, [string]$what) {
+    $b = [IO.File]::ReadAllBytes($path)
+    if ($b.Length -lt 4096 -or [Text.Encoding]::ASCII.GetString($b, 0, 8) -ne "ANDROID!") { Fail "$what is not an Android boot image: $path" }
+    $kSize = [long][BitConverter]::ToUInt32($b, 8)
+    $rSize = [long][BitConverter]::ToUInt32($b, 16)
+    $page = [long][BitConverter]::ToUInt32($b, 36)
+    if ($page -lt 2048 -or $page -gt 16384 -or ($page -band ($page - 1)) -ne 0) { Fail "$what has an unexpected page size ($page)." }
+    $kOff = $page
+    $rOff = $kOff + [long][Math]::Ceiling($kSize / $page) * $page
+    if ($kSize -le 0 -or $rSize -le 0 -or ($rOff + $rSize) -gt $b.Length) { Fail "$what is truncated or its header is invalid." }
+    return [pscustomobject]@{
+        Bytes       = $b
+        PageSize    = $page
+        KernelAddr  = [BitConverter]::ToUInt32($b, 12)
+        RamdiskAddr = [BitConverter]::ToUInt32($b, 20)
+        SecondSize  = [BitConverter]::ToUInt32($b, 24)
+        SecondAddr  = [BitConverter]::ToUInt32($b, 28)
+        TagsAddr    = [BitConverter]::ToUInt32($b, 32)
+        DtSize      = [BitConverter]::ToUInt32($b, 40)
+        Kernel      = (Copy-Bytes $b $kOff $kSize)
+        Ramdisk     = (Copy-Bytes $b $rOff $rSize)
+    }
+}
+
+# The id mkbootimg stores in the header: SHA-1 over each part followed by its 32-bit size.
+function Get-BootImageId([byte[]]$kernel, [byte[]]$ramdisk) {
+    $sha = [Security.Cryptography.SHA1]::Create()
+    try {
+        foreach ($part in @($kernel, $ramdisk, (New-Object byte[] 0))) {
+            if ($part.Length -gt 0) { [void]$sha.TransformBlock($part, 0, $part.Length, $null, 0) }
+            [void]$sha.TransformBlock([BitConverter]::GetBytes([uint32]$part.Length), 0, 4, $null, 0)
+        }
+        [void]$sha.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+        return , $sha.Hash
+    } finally { $sha.Dispose() }
+}
+
+# "Linux version ..." line of a kernel taken from a boot image (zImage with a gzip payload).
+function Get-KernelVersion([byte[]]$kernel) {
+    $buf = New-Object byte[] (32MB)
+    $limit = [Math]::Min($kernel.Length - 3, 131072)
+    for ($i = 0; $i -lt $limit; $i++) {
+        if ($kernel[$i] -ne 0x1F -or $kernel[$i + 1] -ne 0x8B -or $kernel[$i + 2] -ne 8) { continue }
+        $n = 0
+        $ms = New-Object IO.MemoryStream -ArgumentList @($kernel, $i, ($kernel.Length - $i), $false)
+        $gz = New-Object IO.Compression.GZipStream -ArgumentList @($ms, [IO.Compression.CompressionMode]::Decompress)
+        try {
+            while ($n -lt $buf.Length) {
+                $r = $gz.Read($buf, $n, $buf.Length - $n)
+                if ($r -le 0) { break }
+                $n += $r
+            }
+        } catch {} finally { $gz.Dispose(); $ms.Dispose() }
+        if ($n -gt 0) {
+            $m = [regex]::Match([Text.Encoding]::ASCII.GetString($buf, 0, $n), "Linux version [\x20-\x7e]+")
+            if ($m.Success) { return $m.Value }
+        }
+    }
+    return "(version not found)"
+}
+
+# The TWRP image the flash steps write: the guide's, or the one built by 'own-twrp'.
+function Get-TwrpImage {
+    $s = Get-State
+    if ($s.ContainsKey("twrp-own-kernel-sha256")) {
+        $own = Join-Path $Work "twrp-own-kernel.img"
+        if (-not (Test-Path $own)) { Fail "twrp-own-kernel.img is missing: run 'own-twrp' again." }
+        if ((Sha $own) -ne $s["twrp-own-kernel-sha256"]) { Fail "twrp-own-kernel.img does not match the checksum recorded by 'own-twrp': run 'own-twrp' again." }
+        return $own
+    }
+    $twrp = Join-Path $Work "hack\recovery.img"
+    if (-not (Test-Path $twrp)) { Fail "TWRP missing: run 'prepare'." }
+    if ((Sha $twrp) -ne $Known.Twrp.Sha) { Fail "TWRP checksum mismatch." }
+    return $twrp
 }
 
 function Get-FlashTool {
@@ -202,6 +319,7 @@ function Step-Status {
     Say ("MediaTek driver installed: " + $(if (Test-MtkDriver) { "yes" } else { "no" }))
     $tool = Get-FlashTool
     Say ("SP Flash Tool: " + $(if ($tool) { $tool } else { "missing" }))
+    Say ("TWRP image for the flash steps: " + $(if ($s.ContainsKey("twrp-own-kernel-sha256")) { "twrp-own-kernel.img (built by 'own-twrp' around this robot's kernel)" } else { "hack\recovery.img (the guide's)" }))
     $adb = $null
     try { $adb = Get-Adb } catch {}
     if ($adb) { Say ("adb state: " + $(Get-AdbState)) }
@@ -270,7 +388,7 @@ function Step-Prepare {
     $tool = Get-FlashTool
     if (-not $tool) {
         $missing = $true
-        Say ("MISSING: SP Flash Tool v5.1924 for Windows. Download it from https://spflashtool.com/download (file SP_Flash_Tool_v5.1924_Win.zip) and extract it into " + (Join-Path $Work "SP_Flash_Tool"))
+        Say ("MISSING: SP Flash Tool v5.1924 for Windows. Download it from https://spflashtool.com/download (file SP_Flash_Tool_v5.1924_Win.rar, AES password spflashtool.com; Windows 10 and Windows 11 before 23H2 need 7-Zip or WinRAR; a scripted download needs the header Referer: https://spflashtool.com/download) and extract it into " + (Join-Path $Work "SP_Flash_Tool"))
     } else {
         $da = Join-Path (Split-Path $tool) "MTK_AllInOne_DA.bin"
         if ((Sha $tool) -ne $Known.FlashTool.Sha -or -not (Test-Path $da) -or (Sha $da) -ne $Known.FlashDA.Sha) {
@@ -338,12 +456,72 @@ function Step-Backup {
     Ok "backup done. Next: flash-twrp"
 }
 
+# SKMC 1100 A1: its kernel (2022) is newer than the one inside the guide's TWRP (2018). This step
+# builds, on the PC, a TWRP image made of the guide's TWRP (header and ramdisk, unchanged) and the
+# robot's own kernel and device tree, taken from the boot backup. Nothing is sent to the robot;
+# flash-twrp and flash-root then write this image instead of hack\recovery.img.
+function Step-OwnTwrp {
+    $s = Get-State
+    if (-not $s.ContainsKey("done-backup")) { Fail "Run 'backup' first: the image is built from the robot's own boot backup." }
+    $boot = Join-Path $Backup "boot-original.img"
+    Test-BootImage $boot "boot-original.img"
+    if ((Sha $boot) -ne $s["boot-original-sha256"]) { Fail "boot-original.img no longer matches the checksum recorded by 'backup': do not continue." }
+    $twrp = Join-Path $Work "hack\recovery.img"
+    if (-not (Test-Path $twrp)) { Fail "TWRP missing: run 'prepare'." }
+    if ((Sha $twrp) -ne $Known.Twrp.Sha) { Fail "TWRP checksum mismatch." }
+
+    $r = Read-BootImage $boot "boot-original.img"
+    $t = Read-BootImage $twrp "TWRP"
+    Say ("Robot kernel: " + (Get-KernelVersion $r.Kernel))
+    Say ("TWRP kernel : " + (Get-KernelVersion $t.Kernel))
+    if ((Get-BytesSha $r.Kernel) -eq (Get-BytesSha $t.Kernel)) {
+        Ok "The guide's TWRP already carries this robot's kernel: nothing to build. Next: flash-twrp"
+        return
+    }
+    # Both images must share the same layout, or the robot's bootloader would not load the result.
+    foreach ($f in "PageSize", "KernelAddr", "RamdiskAddr", "SecondAddr", "TagsAddr") {
+        if ($r.$f -ne $t.$f) { Fail ("The robot's boot image and TWRP differ on {0} (0x{1:x} / 0x{2:x}): not building. Report this robot's model and image version." -f $f, $r.$f, $t.$f) }
+    }
+    if ($r.SecondSize -ne 0 -or $t.SecondSize -ne 0 -or $r.DtSize -ne 0 -or $t.DtSize -ne 0) { Fail "A second stage or a separate device tree is present: not handled, not building." }
+    foreach ($p in $r.Kernel, $r.Ramdisk, $t.Kernel, $t.Ramdisk) {
+        if ([BitConverter]::ToUInt32($p, 0) -eq 0x58881688) { Fail "MediaTek sub-header found in one of the images: not handled, not building." }
+    }
+    if ([BitConverter]::ToUInt32($r.Kernel, 0x24) -ne 0x016F2818) { Fail "The robot's kernel is not an ARM zImage: not building." }
+    if ($t.Ramdisk[0] -ne 0x1F -or $t.Ramdisk[1] -ne 0x8B) { Fail "TWRP's ramdisk is not gzip: not building." }
+
+    $page = $t.PageSize
+    $kPad = [long][Math]::Ceiling($r.Kernel.Length / $page) * $page
+    $rPad = [long][Math]::Ceiling($t.Ramdisk.Length / $page) * $page
+    $size = $page + $kPad + $rPad
+    if ($size -gt $PartitionSize) { Fail ("The result would be {0} bytes: larger than the partition." -f $size) }
+    $img = New-Object byte[] $size
+    [Array]::Copy($t.Bytes, 0, $img, 0, $page)                                           # TWRP's header: command line, load addresses
+    [Array]::Copy([BitConverter]::GetBytes([uint32]$r.Kernel.Length), 0, $img, 8, 4)     # kernel_size
+    [Array]::Copy([BitConverter]::GetBytes([uint32]$t.Ramdisk.Length), 0, $img, 16, 4)   # ramdisk_size
+    [Array]::Clear($img, 576, 32)
+    [Array]::Copy((Get-BootImageId $r.Kernel $t.Ramdisk), 0, $img, 576, 20)              # id
+    [Array]::Copy($r.Kernel, 0, $img, $page, $r.Kernel.Length)                           # the robot's kernel and device tree
+    [Array]::Copy($t.Ramdisk, 0, $img, $page + $kPad, $t.Ramdisk.Length)                 # TWRP itself
+    $out = Join-Path $Work "twrp-own-kernel.img"
+    [IO.File]::WriteAllBytes($out, $img)
+
+    # Read the result back from disk and compare each part with its source.
+    $o = Read-BootImage $out "twrp-own-kernel.img"
+    if ((Get-BytesSha $o.Kernel) -ne (Get-BytesSha $r.Kernel) -or (Get-BytesSha $o.Ramdisk) -ne (Get-BytesSha $t.Ramdisk)) {
+        Remove-Item -Force $out
+        Fail "The image written does not read back correctly: nothing to flash."
+    }
+    Set-State "twrp-own-kernel-sha256" (Sha $out)
+    Set-State "done-own-twrp" (Get-Date).ToString("s")
+    Ok ("TWRP with this robot's own kernel: $out ({0} bytes). 'flash-twrp' and 'flash-root' will write it instead of hack\recovery.img." -f $size)
+    Ok "own-twrp done. Next: flash-twrp"
+}
+
 function Step-FlashTwrp {
     if (-not (Get-State).ContainsKey("done-backup")) { Fail "Run 'backup' first: never flash without the backups." }
-    $twrp = Join-Path $Work "hack\recovery.img"
-    if ((Sha $twrp) -ne $Known.Twrp.Sha) { Fail "TWRP checksum mismatch." }
+    $twrp = Get-TwrpImage
     $cfg = Write-DownloadConfig "flash-twrp" $twrp ""
-    $code = Invoke-FlashTool $cfg "TWRP into boot"
+    $code = Invoke-FlashTool $cfg ("TWRP into boot (" + (Split-Path $twrp -Leaf) + ")")
     if ($code -ne 0) { Fail ("SP Flash Tool reported an error ($code). Use the GUI: AGENTS.md, 'GUI fallback: Download Only' with boot = $twrp only.") }
     Set-State "done-flash-twrp" (Get-Date).ToString("s")
     Human "Switch the robot OFF, UNPLUG the USB cable, switch it ON: TWRP (a blue/black recovery screen) appears. Then plug the cable back in. (Switched on with the cable in, the robot stops on a battery screen.)"
@@ -353,9 +531,17 @@ function Step-FlashTwrp {
 function Step-Root {
     $st = Wait-AdbState @("recovery") $WaitSeconds
     if ($st -ne "recovery") { NeedHuman "adb does not see TWRP (state: '$st'). The robot must show TWRP and the cable must be plugged in AFTER it started." }
+    # This TWRP restarts by itself about 6 min 40 s after it started (watchdog): the step takes
+    # about 20 s, so start it on a fresh TWRP.
+    $uptime = 0
+    [void][double]::TryParse(((Adb shell "cat /proc/uptime") -split " ")[0], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$uptime)
+    if ($uptime -gt 300) {
+        NeedHuman ("TWRP has been running for {0:N0} s and restarts by itself at about 400 s. Restart it now (off, unplug, on, plug in once TWRP shows; swipe 'Allow Modifications' if asked), then run 'root' again right away." -f $uptime)
+    }
     $boot = Join-Path $Backup "boot-original.img"
     Test-BootImage $boot "boot-original.img"
     $magisk = Join-Path $Downloads "Magisk-v31.0.apk"
+    if ((Sha $magisk) -ne $Known.Magisk.Sha) { Fail "Magisk-v31.0.apk checksum mismatch: run 'prepare'." }
     $key = Join-Path $env:USERPROFILE ".android\adbkey.pub"
     Say (Adb shell "rm -rf /tmp/magisk /tmp/orig /tmp/twrp-root.sh")
     Say (Adb push $magisk /tmp/magisk.apk)
@@ -382,9 +568,9 @@ function Step-FlashRoot {
     if (-not (Get-State).ContainsKey("done-root")) { Fail "Run 'root' first." }
     $patched = Join-Path $Work "boot-magisk.img"
     Test-BootImage $patched "boot-magisk.img"
-    $twrp = Join-Path $Work "hack\recovery.img"
+    $twrp = Get-TwrpImage
     $cfg = Write-DownloadConfig "flash-root" $patched $twrp
-    $code = Invoke-FlashTool $cfg "Magisk boot into boot, TWRP into recovery"
+    $code = Invoke-FlashTool $cfg ("Magisk boot into boot, TWRP into recovery (" + (Split-Path $twrp -Leaf) + ")")
     if ($code -ne 0) { Fail ("SP Flash Tool reported an error ($code). Use the GUI: AGENTS.md, 'GUI fallback: Download Only' with boot = $patched and recovery = $twrp.") }
     Set-State "done-flash-root" (Get-Date).ToString("s")
     Human "Switch the robot OFF, UNPLUG the USB cable, switch it ON: the stock Monsieur Cuisine app starts. Then plug the cable back in."
@@ -402,16 +588,27 @@ function Step-Android {
     if ($pkgs -notmatch "com.topjohnwu.magisk") {
         Say (Adb install -r (Join-Path $Downloads "Magisk-v31.0.apk"))
     }
+    Human "Watch the robot's screen: Magisk asks for superuser access for 'Shell' in a few seconds. Tap GRANT (Autoriser) within 10 seconds."
+    Start-Sleep -Seconds 8
     $id = Adb shell "su -c 'id -u'"
     if ($id -ne "0") {
-        NeedHuman "On the robot's screen, Magisk asks for superuser access for 'Shell': tap GRANT (Autoriser) within 10 seconds. Then run 'android' again."
+        NeedHuman "Root was not granted to 'Shell'. If the prompt was missed, Magisk now refuses for good: open the Magisk app > Superuser, switch 'Shell' on. Then run 'android' again."
     }
     $expected = (Get-State)["boot-magisk-sha256"]
     if ($expected) {
-        $bb = "/data/adb/magisk/busybox"
-        $flashed = Adb shell "su -c '$bb head -c $PartitionSize $ByName/boot | $bb sha256sum'"
-        if ($flashed -notmatch $expected) { Say ("WARNING: the boot partition differs from boot-magisk.img (" + $flashed + ")") }
+        # Read the partition back and hash it on the PC: /data/adb/magisk/busybox only exists after
+        # 'install' (setup-root.sh), and Android 6's toolbox has no sha256sum.
+        $tmp = "/data/local/tmp/toque-boot-check.img"
+        $local = Join-Path $Work "boot-check.img"
+        $mib = [int]($PartitionSize / 1048576)
+        Say (Adb shell "su -c 'dd if=$ByName/boot of=$tmp bs=1048576 count=$mib && chmod 644 $tmp'")
+        if (Test-Path $local) { Remove-Item -Force $local }
+        Say (Adb pull $tmp $local)
+        Say (Adb shell "su -c 'rm -f $tmp'")
+        if (-not (Test-Path $local)) { Say "WARNING: could not read the boot partition back to check it." }
+        elseif ((Sha $local) -ne $expected) { Say ("WARNING: the boot partition differs from boot-magisk.img (" + (Sha $local) + ")") }
         else { Ok "boot partition = boot-magisk.img" }
+        if (Test-Path $local) { Remove-Item -Force $local }
     }
     Set-State "done-android" (Get-Date).ToString("s")
     Ok "Root works (uid 0). Next: install"
@@ -433,23 +630,36 @@ function Step-Install {
     } finally { Pop-Location }
     $ver = Adb shell "dumpsys package app.toque | grep versionName"
     if ($ver -notmatch "versionName") { Fail "Toque is not installed." }
+    $mode = Get-MachineMode
+    if ($mode -ne "" -and $mode -ne "hardware") {
+        NeedHuman ("Toque is in '" + $mode + "' mode, so the motor is not driven. On the robot, EMPTY bowl, lid closed, hand near the main switch: Toque > Settings > Machine > Real machine > Apply, then run the install step again so the mode can be verified. Success: the badge reads Ready/« Prête » with no Demo or Twin marker AND the journal must show the real link, e.g. 'liaison ouverte : Base moteur (/dev/ttyMT...)'; the simulated-base line means the mode was not applied.")
+    }
+    if ($mode -eq "hardware") { Ok "Toque machine mode: hardware (real machine)." }
+    elseif ($mode -eq "") { Say "WARNING: Toque machine mode could not be verified (su or prefs unreadable). On the robot, Settings > Machine > Real machine must be applied before the motor can run." }
     Set-State "done-install" (Get-Date).ToString("s")
     Ok ("Toque installed: " + $ver.Trim())
-    Human "On the robot, EMPTY bowl, lid closed, hand near the main switch: Toque > Settings > Machine > Real machine > Apply. The badge at the top right must show 'Ready' ('Prete' in French). Then try Manual cooking: 10 s, speed 2."
     Ok "install done. Next: wifi (optional)"
 }
 
 function Step-Wifi {
-    $st = Get-AdbState
-    if ($st -ne "device") { NeedHuman "Connect the robot with the USB cable (Android started), then run 'wifi' again." }
-    $addr = Adb shell "ip -f inet addr show wlan0"
-    $m = [regex]::Match($addr, "inet (\d+\.\d+\.\d+\.\d+)")
-    if (-not $m.Success) {
-        NeedHuman "The robot is not on Wi-Fi. In Toque, tap the clock at the top right 5 times quickly to open the Android settings, join the home Wi-Fi, come back with the 'Back to Toque' button."
+    # -Ip is the Wi-Fi address ("10.0.0.5" or "10.0.0.5:5555"). Before the switch the robot is on
+    # the cable, with a serial; already on Wi-Fi it is the TCP device only, and the cable is not
+    # needed, so fall back to any device. setprop/tcpip are harmless over the TCP serial.
+    $usb = Get-AdbDevice -Usb
+    if (-not $usb -or $usb.State -ne "device") { $usb = Get-AdbDevice }
+    if (-not $usb) { NeedHuman "Connect the robot with the USB cable (Android started), then run 'wifi' again." }
+    if ($usb.State -ne "device") { NeedHuman ("adb sees the robot as '" + $usb.State + "': accept the ADB prompt on the robot (or unplug/replug) and run 'wifi' again.") }
+    $robotIp = $Ip -replace ':5555$', ''
+    if ($robotIp -eq "") {
+        $addr = Adb -s $usb.Serial shell "ip -f inet addr show wlan0"
+        $m = [regex]::Match($addr, "inet (\d+\.\d+\.\d+\.\d+)")
+        if (-not $m.Success) {
+            NeedHuman "The robot is not on Wi-Fi. In Toque, tap the clock at the top right 5 times quickly to open the Android settings, join the home Wi-Fi, come back with the 'Back to Toque' button."
+        }
+        $robotIp = $m.Groups[1].Value
     }
-    $robotIp = $m.Groups[1].Value
-    Say (Adb shell "su -c 'setprop persist.adb.tcp.port 5555'")
-    Say (Adb tcpip 5555)
+    Say (Adb -s $usb.Serial shell "su -c 'setprop persist.adb.tcp.port 5555'")
+    Say (Adb -s $usb.Serial tcpip 5555)
     Start-Sleep -Seconds 5
     Say (Adb connect "${robotIp}:5555")
     $check = Adb -s "${robotIp}:5555" shell "su -c 'id -u'"
@@ -465,7 +675,8 @@ function Step-Cleanup {
     $blocks = $out -split "(\r?\n){2,}"
     $published = @()
     foreach ($b in $blocks) {
-        if ($b -match "cdc-acm\.inf") {
+        # cdc-acm.inf is a generic name: only remove the MediaTek one.
+        if ($b -match "cdc-acm\.inf" -and $b -match "MediaTek") {
             $m = [regex]::Match($b, "(oem\d+\.inf)")
             if ($m.Success) { $published += $m.Groups[1].Value }
         }
@@ -487,6 +698,7 @@ switch ($Step) {
     "prepare" { Step-Prepare }
     "driver" { Step-Driver }
     "backup" { Step-Backup }
+    "own-twrp" { Step-OwnTwrp }
     "flash-twrp" { Step-FlashTwrp }
     "root" { Step-Root }
     "flash-root" { Step-FlashRoot }

@@ -5,6 +5,7 @@ import android.graphics.drawable.ColorDrawable
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.widget.EditText
@@ -22,10 +23,15 @@ import app.toque.core.time.ZoneLookup
 import app.toque.core.update.Release
 import app.toque.recipes.LidlSync
 import app.toque.recipes.OnlineSync
+import app.toque.recipes.SyncProgress
+import app.toque.recipes.RecipeFiles
+import app.toque.core.recipes.UserRecipes
 import app.toque.ui.Icon
 import app.toque.ui.MainActivity
 import app.toque.ui.Screen
+import app.toque.ui.Sounds
 import app.toque.ui.Ui
+import app.toque.ui.UpdateFlow
 import app.toque.update.Updater
 
 class SettingsScreen(a: MainActivity) : Screen(a) {
@@ -35,21 +41,22 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
     private lateinit var host: EditText
     private lateinit var port: EditText
     private lateinit var syncText: TextView
+    private lateinit var syncBtn: View
+    private lateinit var stopSyncBtn: View
+    private lateinit var importBtn: View
     private lateinit var bowlText: TextView
     private lateinit var linkText: TextView
     private lateinit var timeText: TextView
     private var settingTime = false
     private var mode = a.prefs.mode
-    private var syncing = false
 
-    private enum class Upd { IDLE, CHECKING, UP_TO_DATE, AVAILABLE, DOWNLOADING, INSTALLING, ERROR }
+    private enum class Upd { IDLE, CHECKING, UP_TO_DATE, AVAILABLE, ERROR }
     private val updater by lazy { Updater(a) }
     private lateinit var updText: TextView
     private lateinit var updButtons: LinearLayout
     private var upd = Upd.IDLE
     private var release: Release? = null
     private var updMessage = ""
-    private var updPercent = 0
 
     override fun build(): View {
         val col = Ui.vertical(c)
@@ -84,6 +91,12 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
         })
         bowlText = Ui.text(c, "", 15f, Ui.TEXT3).apply { setLineSpacing(0f, 1.1f) }
         safety.addView(bowlText, Ui.lp(t = 6))
+        safety.addView(toggle(tr("Inverser le capteur du bol"), a.prefs.invertBowl) { on ->
+            a.prefs.invertBowl = on
+            a.machine.reconfigure { a.refusal(it) }
+        }, Ui.lp(t = 10))
+        safety.addView(Ui.text(c, tr("À activer si le capteur indique « bol détecté » quand le bol est retiré, et l'inverse quand il est en place."),
+            15f, Ui.TEXT3).apply { setLineSpacing(0f, 1.1f) }, Ui.lp(t = 6))
         safety.addView(toggle(tr("Montée progressive de la vitesse si le contenu est chaud"), a.prefs.hotRamp) { on ->
             a.prefs.hotRamp = on
             a.machine.reconfigure { a.refusal(it) }
@@ -94,6 +107,11 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
         safety.addView(Ui.text(c, tr("Les réglages qui se suivent sans geste à faire entre eux partent ensemble d'un seul appui sur Lancer : la lame passe directement à la vitesse et à la température suivantes."),
             15f, Ui.TEXT3).apply { setLineSpacing(0f, 1.1f) }, Ui.lp(t = 6))
         safety.addView(toggle(tr("Sons"), a.prefs.sound) { a.prefs.sound = it }, Ui.lp(t = 10))
+        safety.addView(Ui.text(c, tr("Son quand la quantité à peser est atteinte"), 18f, Ui.TEXT), Ui.lp(t = 10))
+        safety.addView(dropdown(Sounds.WEIGH_SOUNDS.map { it.first to tr(it.second) }, a.prefs.weighSound) { k ->
+            a.prefs.weighSound = k
+            Sounds.weighReached(k)
+        }, Ui.lp(Ui.MATCH, Ui.u(58), t = 8))
 
         // ---- Langue (titre bilingue : trouvable quelle que soit la langue affichée)
         val language = section(right, "Langue · Language", Icon.Kind.INFO)
@@ -102,6 +120,19 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
             a.prefs.language = code
             a.applyLanguage()
         }, Ui.lp(Ui.MATCH, Ui.u(58), t = 4))
+
+        // ---- Écran
+        val screen = section(right, tr("Écran"), Icon.Kind.CLOCK)
+        val delays = listOf("0" to tr("Jamais")) + listOf(2, 5, 10, 15, 30).map { it.toString() to tr("Après %d min", it) }
+        screen.addView(Ui.text(c, tr("Mise en veille"), 18f, Ui.TEXT))
+        screen.addView(dropdown(delays, a.prefs.standbyMinutes.toString()) { m -> a.prefs.standbyMinutes = m.toInt() },
+            Ui.lp(Ui.MATCH, Ui.u(58), t = 8))
+        screen.addView(Ui.text(c, tr("Sans geste ni programme en cours, l'écran s'assombrit et n'affiche plus que l'heure. Touchez-le ou tournez le bouton pour reprendre ; le couvercle et la balance le réveillent aussi."),
+            15f, Ui.TEXT3).apply { setLineSpacing(0f, 1.1f) }, Ui.lp(t = 8))
+        val knob = listOf("normal" to tr("Normale"), "dim" to tr("Plus légère"), "off" to tr("Éteinte"))
+        screen.addView(Ui.text(c, tr("Molette pendant la veille"), 18f, Ui.TEXT), Ui.lp(t = 12))
+        screen.addView(dropdown(knob, a.prefs.standbyKnob) { a.prefs.standbyKnob = it },
+            Ui.lp(Ui.MATCH, Ui.u(58), t = 8))
 
         // ---- Date et heure
         val time = section(right, tr("Date et heure"), Icon.Kind.CLOCK)
@@ -125,15 +156,36 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
         syncText = Ui.text(c, "", 16f, Ui.TEXT)
         lidl.addView(syncText, Ui.lp(t = 10))
         val b1 = Ui.horizontal(c)
-        b1.addView(Ui.button(c, tr("Synchroniser"), Ui.Style.PRIMARY, Icon.Kind.SYNC, height = 58) { sync(online = true) }, Ui.lp(Ui.WRAP, Ui.WRAP, r = 10))
+        syncBtn = Ui.button(c, tr("Synchroniser"), Ui.Style.PRIMARY, Icon.Kind.SYNC, height = 58) { sync(online = true) }
+        b1.addView(syncBtn, Ui.lp(Ui.WRAP, Ui.WRAP, r = 10))
+        // Visible seulement pendant une synchronisation ; ce qui est déjà fait est gardé.
+        stopSyncBtn = Ui.button(c, tr("Arrêter"), Ui.Style.SECONDARY, Icon.Kind.STOP, height = 58) { SyncProgress.requestStop() }
+        b1.addView(stopSyncBtn)
         lidl.addView(b1, Ui.lp(t = 12))
         lidl.addView(Ui.text(c, tr("Autre source : les recettes déjà présentes dans l'appli d'origine du robot (remplacent celles du site)."),
             14f, Ui.TEXT3).apply { setLineSpacing(0f, 1.1f) }, Ui.lp(t = 12))
-        val b2 = Ui.horizontal(c)
-        b2.addView(Ui.button(c, tr("Importer de l'appli d'origine"), Ui.Style.SECONDARY, height = 52) { sync(online = false) }, Ui.lp(Ui.WRAP, Ui.WRAP, r = 10))
-        b2.addView(Ui.button(c, tr("Ouvrir l'appli d'origine"), Ui.Style.GHOST, Icon.Kind.LINK, height = 52) { a.openVendorApp() })
-        lidl.addView(b2, Ui.lp(t = 6))
+        // Un bouton par ligne : côte à côte, « Ouvrir l'appli d'origine » n'avait plus la place et
+        // son texte se coupait au milieu d'un mot.
+        importBtn = Ui.button(c, tr("Importer de l'appli d'origine"), Ui.Style.SECONDARY, height = 52) { sync(online = false) }
+        lidl.addView(importBtn, Ui.lp(Ui.WRAP, Ui.WRAP, t = 6))
+        lidl.addView(Ui.button(c, tr("Ouvrir l'appli d'origine"), Ui.Style.GHOST, Icon.Kind.LINK, height = 52) { a.openVendorApp() },
+            Ui.lp(Ui.WRAP, Ui.WRAP, t = 8))
         lidl.addView(toggle(tr("Synchro automatique chaque nuit"), a.prefs.autoSync) { a.prefs.autoSync = it }, Ui.lp(t = 10))
+        lidl.addView(toggle(tr("Recettes des autres langues"), a.prefs.foreignRecipes) {
+            a.prefs.foreignRecipes = it
+            a.toast(tr("Pris en compte à la prochaine synchronisation"))
+        }, Ui.lp(t = 10))
+        lidl.addView(Ui.text(c, tr("Ajoute les recettes qui n'existent pas dans votre langue, prises en anglais, français, allemand, espagnol… Chacune n'apparaît qu'une fois, avec sa langue sur la vignette."),
+            14f, Ui.TEXT3).apply { setLineSpacing(0f, 1.1f) }, Ui.lp(t = 6))
+
+        // ---- Mes recettes
+        val mine = section(right, tr("Mes recettes"), Icon.Kind.EDIT)
+        mine.addView(Ui.text(c, tr("Sauvegardez vos recettes, ou passez-les à un autre robot, avec le fichier %s du dossier Download.", UserRecipes.FILE_NAME),
+            16f, Ui.TEXT2).apply { setLineSpacing(0f, 1.15f) })
+        val files = Ui.horizontal(c)
+        files.addView(Ui.button(c, tr("Exporter"), Ui.Style.SECONDARY, Icon.Kind.UPLOAD, height = 52) { recipeFiles(export = true) }, Ui.lp(Ui.WRAP, Ui.WRAP, r = 10))
+        files.addView(Ui.button(c, tr("Importer"), Ui.Style.SECONDARY, Icon.Kind.DOWNLOAD, height = 52) { recipeFiles(export = false) })
+        mine.addView(files, Ui.lp(t = 12))
 
         // ---- Mises à jour
         val updates = section(left, tr("Mises à jour"), Icon.Kind.INFO)
@@ -141,7 +193,8 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
         updates.addView(updText)
         updButtons = Ui.horizontal(c)
         updates.addView(updButtons, Ui.lp(t = 12))
-        Updater.onInstallError = { msg -> updateFailed(msg) }
+        updates.addView(toggle(tr("Prévenir quand une version sort"), a.prefs.updateAlerts) { a.prefs.updateAlerts = it }, Ui.lp(t = 10))
+        a.updates.available?.let { release = it; upd = Upd.AVAILABLE }
         renderUpdate()
 
         // ---- Outils
@@ -220,11 +273,32 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
         val box = Ui.horizontal(c)
         box.setPadding(Ui.u(16), 0, Ui.u(14), 0)
         box.background = Ui.pressable(Ui.round(Ui.SURFACE2, 16f, Ui.STROKE, 1f), 16f)
-        val label = options.firstOrNull { it.first == selected }?.second ?: options.first().second
-        box.addView(Ui.text(c, label, 19f, Ui.TEXT), LinearLayout.LayoutParams(0, Ui.WRAP, 1f))
+        var current = selected
+        fun labelOf(code: String) = options.firstOrNull { it.first == code }?.second ?: options.first().second
+        val label = Ui.text(c, labelOf(current), 19f, Ui.TEXT)
+        box.addView(label, LinearLayout.LayoutParams(0, Ui.WRAP, 1f))
         box.addView(Icon(c, Icon.Kind.CHEVRON, Ui.TEXT2).apply { rotation = 90f }, LinearLayout.LayoutParams(Ui.u(22), Ui.u(22)))
         box.isClickable = true
+        // Poser le doigt hors de la liste la ferme, y compris sur la case elle-même, qui reçoit aussi cet
+        // appui : il faut s'en souvenir, sinon le même appui la rouvre aussitôt.
+        var shown: PopupWindow? = null
+        var boxDownAt = 0L
+        var closedByDownAt = -1L
+        box.setOnTouchListener { _, e ->
+            if (e.actionMasked == MotionEvent.ACTION_DOWN) boxDownAt = e.downTime
+            false
+        }
         box.setOnClickListener {
+            shown?.let {
+                if (it.isShowing) {
+                    it.dismiss()
+                    return@setOnClickListener
+                }
+            }
+            if (closedByDownAt == boxDownAt) {
+                closedByDownAt = -1L
+                return@setOnClickListener
+            }
             val list = Ui.vertical(c)
             list.setPadding(0, Ui.u(6), 0, Ui.u(6))
             val scroll = ScrollView(c).apply {
@@ -234,20 +308,31 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
             val height = if (options.size > 7) Ui.u(400) else ViewGroup.LayoutParams.WRAP_CONTENT
             val popup = PopupWindow(scroll, box.width, height, false)
             for ((code, name) in options) {
-                val row = Ui.text(c, name, 19f, if (code == selected) Ui.ACCENT else Ui.TEXT)
+                val row = Ui.text(c, name, 19f, if (code == current) Ui.ACCENT else Ui.TEXT)
                 row.setPadding(Ui.u(16), Ui.u(14), Ui.u(16), Ui.u(14))
                 row.background = Ui.pressable(Ui.round(0, 0f), 0f)
                 row.isClickable = true
                 row.setOnClickListener {
                     popup.dismiss()
-                    if (code != selected) onPick(code)
+                    if (code != current) {
+                        // Le choix s'affiche tout de suite (avant, il fallait rouvrir les réglages).
+                        current = code
+                        label.text = labelOf(code)
+                        onPick(code)
+                    }
                 }
                 list.addView(row, Ui.lp(Ui.MATCH, Ui.WRAP))
             }
             popup.setBackgroundDrawable(ColorDrawable(0))
             popup.isOutsideTouchable = true
+            popup.setTouchInterceptor { _, e ->
+                if (e.actionMasked == MotionEvent.ACTION_OUTSIDE) closedByDownAt = e.downTime
+                false
+            }
+            popup.setOnDismissListener { if (shown === popup) shown = null }
             popup.elevation = Ui.uf(8f)
             popup.showAsDropDown(box, 0, Ui.u(6))
+            shown = popup
         }
         return box
     }
@@ -339,22 +424,34 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
     }
 
     private fun sync(online: Boolean) {
-        if (syncing) return
+        if (SyncProgress.running) return
         if (!online && a.prefs.mode != Prefs.Mode.HARDWARE) {
             a.toast(tr("Disponible une fois Toque installé sur le robot (mode Machine réelle)"), Ui.WARN)
             return
         }
-        syncing = true
-        syncText.text = tr("Synchronisation en cours… (quelques minutes)")
+        // L'avancement vit dans SyncProgress, pas dans cet écran : on peut le quitter et y revenir.
+        SyncProgress.start(tr("Synchronisation en cours… (quelques minutes)"), stoppable = online)
+        val app = a.app
         Thread {
-            val r = if (online) OnlineSync(a, a.prefs, a.app.recipes, a.app.log).sync { msg -> view.post { syncText.text = msg } }
-            else LidlSync(a, a.prefs, a.app.recipes, a.app.log).importNow { msg -> view.post { syncText.text = msg } }
-            view.post {
-                syncing = false
-                refreshSync()
-                a.toast(r.message, if (r.ok) Ui.OK else Ui.WARN)
+            val r = if (online) OnlineSync(app, app.prefs, app.recipes, app.log).sync()
+            else try {
+                LidlSync(app, app.prefs, app.recipes, app.log).importNow { SyncProgress.report(it) }
+            } finally {
+                SyncProgress.finished()
             }
+            a.runOnUiThread { a.toast(r.message, if (r.ok) Ui.OK else Ui.WARN) }
         }.start()
+    }
+
+    private fun recipeFiles(export: Boolean) {
+        a.withStorage { ok ->
+            if (!ok) { a.toast(tr("Accès au dossier Download refusé"), Ui.WARN); return@withStorage }
+            Thread {
+                val files = RecipeFiles(a.app.recipes, a.app.log)
+                val r = if (export) files.export() else files.import()
+                view.post { a.toast(r.message, if (r.ok) Ui.OK else Ui.WARN) }
+            }.start()
+        }
     }
 
     private fun refreshTime(message: String? = null) {
@@ -383,9 +480,21 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
     }
 
     private fun refreshSync() {
+        val progress = SyncProgress.message
+        val running = progress != null
+        // Pendant une synchronisation : rien à relancer, et un bouton pour l'arrêter.
+        Ui.setButtonEnabled(syncBtn, !running)
+        Ui.setButtonEnabled(importBtn, !running)
+        stopSyncBtn.visibility = if (running && SyncProgress.stoppable) View.VISIBLE else View.GONE
+        Ui.setButtonEnabled(stopSyncBtn, !SyncProgress.stopRequested)
         val last = a.prefs.lastSyncResult
-        syncText.text = (if (last.isEmpty()) tr("Jamais synchronisé") else tr("Dernière synchro le %s", last)) +
-            "\n" + tr("%d recettes dans Toque", a.app.recipes.count)
+        val first = when {
+            progress == null -> if (last.isEmpty()) tr("Jamais synchronisé") else tr("Dernière synchro le %s", last)
+            SyncProgress.stopRequested -> tr("Arrêt en cours…")
+            else -> progress
+        }
+        // Le nombre de recettes reste affiché sous l'avancement : « Recettes : 343 / 1667 » compte les fiches relues, pas le catalogue.
+        syncText.text = first + "\n" + if (a.app.recipes.loaded) tr("%d recettes dans Toque", a.app.recipes.count) else tr("Chargement des recettes…")
     }
 
     // ------------------------------------------------------------------ mises à jour
@@ -398,10 +507,8 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
             Upd.IDLE -> installed + "\n" + tr("Les nouvelles versions sont publiées sur GitHub.")
             Upd.CHECKING -> installed + "\n" + tr("Recherche sur GitHub…")
             Upd.UP_TO_DATE -> installed + "\n" + tr("Toque est à jour.")
-            Upd.AVAILABLE -> installed + "\n" + tr("Nouvelle version disponible : %s", r?.version) + notes(r)
-            Upd.DOWNLOADING -> tr("Téléchargement de la version %s… %d %%", r?.version, updPercent)
-            Upd.INSTALLING -> tr("Installation de la version %s… Toque va redémarrer.\n" +
-                "Si Android demande une confirmation, touchez « Installer ».", r?.version)
+            Upd.AVAILABLE -> installed + "\n" + tr("Nouvelle version disponible : %s", r?.version) +
+                UpdateFlow.notes(r).let { if (it.isEmpty()) "" else "\n\n" + it }
             Upd.ERROR -> installed + "\n" + updMessage
         }
         updButtons.removeAllViews()
@@ -413,18 +520,12 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
                     Ui.lp(Ui.WRAP, Ui.WRAP, r = 10))
                 updButtons.addView(Ui.button(c, tr("Plus tard"), Ui.Style.GHOST, height = 58) { upd = Upd.IDLE; renderUpdate() })
             }
-            else -> {}
+            Upd.CHECKING -> {}
         }
     }
 
-    private fun notes(r: Release?): String {
-        val text = r?.notes?.lines()?.map { it.trim() }?.filter { it.isNotEmpty() }?.take(4)?.joinToString("\n") ?: ""
-        if (text.isEmpty()) return ""
-        return "\n\n" + if (text.length > 280) text.substring(0, 280) + "…" else text
-    }
-
     private fun checkUpdate() {
-        if (upd == Upd.CHECKING || upd == Upd.DOWNLOADING || upd == Upd.INSTALLING) return
+        if (upd == Upd.CHECKING) return
         upd = Upd.CHECKING
         renderUpdate()
         Thread {
@@ -432,7 +533,9 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
                 val r = updater.latest()
                 view.post {
                     release = r
-                    upd = if (updater.isNewer(r)) Upd.AVAILABLE else Upd.UP_TO_DATE
+                    val newer = updater.isNewer(r)
+                    a.updates.known(r, newer)
+                    upd = if (newer) Upd.AVAILABLE else Upd.UP_TO_DATE
                     renderUpdate()
                     if (upd == Upd.AVAILABLE) installUpdate()
                 }
@@ -448,50 +551,26 @@ class SettingsScreen(a: MainActivity) : Screen(a) {
     /** Propose l'installation dans une fenêtre (toujours visible, même si la carte est hors écran). */
     private fun installUpdate() {
         val r = release ?: return
-        if (a.snapshot.busy) {
-            a.toast(tr("Arrêtez d'abord le programme en cours"), Ui.WARN)
-            return
-        }
-        a.confirm(
-            tr("Version %s disponible", r.version),
-            notes(r).trim().let { if (it.isEmpty()) "" else it + "\n\n" } +
-                tr("Toque va la télécharger depuis GitHub, l'installer puis redémarrer (environ une minute). " +
-                    "Le moteur reste arrêté pendant l'opération."),
-            tr("Installer"), tr("Plus tard"), icon = Icon.Kind.SYNC,
-        ) {
-            a.machine.suspendPort { v ->
-                if (!v.ok) { a.refusal(v); return@suspendPort }
-                upd = Upd.DOWNLOADING
-                updPercent = 0
-                renderUpdate()
-                Thread {
-                    try {
-                        val file = updater.download(r) { p -> view.post { updPercent = p; renderUpdate() } }
-                        view.post { upd = Upd.INSTALLING; renderUpdate() }
-                        updater.install(file)
-                    } catch (e: Updater.Failure) {
-                        view.post { updateFailed(e.message ?: tr("Erreur")) }
-                    } catch (e: Exception) {
-                        a.app.log.crash("maj", e)
-                        view.post { updateFailed(tr("Erreur inattendue : %s", e.message)) }
-                    }
-                }.start()
-            }
-        }
+        UpdateFlow.offer(a, r) { msg -> upd = Upd.ERROR; updMessage = msg; renderUpdate() }
     }
 
-    private fun updateFailed(message: String) {
-        a.machine.resumePort()
-        upd = Upd.ERROR
-        updMessage = message
-        renderUpdate()
-        a.toast(message, Ui.WARN)
-    }
+    /** Désabonnement du suivi des recettes (le nombre s'affiche une fois la base chargée). */
+    private var unsubRecipes: (() -> Unit)? = null
+    private var unsubSync: (() -> Unit)? = null
 
     override fun onShow() {
         mode = a.prefs.mode
         renderModes()
-        if (!syncing) refreshSync()
+        refreshSync()
+        unsubRecipes = a.app.recipes.onChange { refreshSync() }
+        unsubSync = SyncProgress.onChange { refreshSync() }
+    }
+
+    override fun onHide() {
+        unsubRecipes?.invoke()
+        unsubRecipes = null
+        unsubSync?.invoke()
+        unsubSync = null
     }
 
     override fun onSnapshot(s: Snapshot) {
